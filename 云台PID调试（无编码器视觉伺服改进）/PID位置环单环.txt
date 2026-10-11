@@ -1,0 +1,293 @@
+
+#include "stm32f10x.h"
+#include "sys.h"
+#include "control.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "SR04.h"
+#include "AllHeader.h"
+
+
+//u8 Flag_Show=0;                //Í£Ö¹±êÖ¾Î»ºÍ ÏÔÊ¾±êÖ¾Î» Ä¬ÈÏÍ£Ö¹ ÏÔÊ¾´ò¿ª
+float Velocity1,Velocity2;     //µç»úPWM±äÁ¿
+// Positon1ÎªÉÏÏÂ300~900£¬Position2Îª×óÓÒ£¬300~1200ÎªÒË£¬´ÓÏÂµ½ÉÏ£¬´ÓÓÒµ½×ó
+// C70ÉãÏñÍ·µÄ²îÖµ¶ÔÓ¦ÎªÒ»¸öºá-150~150×Ý-100~100µÄÇø¼ä
+// 700£¬630-->950, 750(¾µÍ·½Ç¶È50)ÎªºÏÊÊµÄÄ¬ÈÏµãÎ»£¬Ç¡ºÃÎªÖ±ÊÓÇ°·½
+float   Position1=970,Position2=600; 
+float   Speed=5,Speed0=15;            //ÔË¶¯ËÙ¶ÈÉèÖÃ                 
+float   Target1=970,Target2=600;     //µç»úÄ¿±êÖµ
+float   pos1buf=-35,pos2buf=0;
+float   Position_KP01=6,Position_KI01=0,Position_KD01=20;  //Î»ÖÃ¿ØÖÆPID²ÎÊý
+float   Position_KP02=6,Position_KI02=0,Position_KD02=20;  //Î»ÖÃ¿ØÖÆPID²ÎÊý
+float   Position_KP1=0,Position_KI1=0,Position_KD1=0;  //ËÙ¶È¿ØÖÆPID²ÎÊý
+float   Position_KP2=0,Position_KI2=0,Position_KD2=0;  //ËÙ¶È¿ØÖÆPID²ÎÊý
+float   pid01,pid02;
+uint8_t Urxbuf[8]; //´®¿Ú½ÓÊÕÊý¾ÝÊý×é
+
+u32 times_elcmotor=0;
+u32 times_noTarget = 0;
+int target2_Round = 750;
+
+//RTOSÉùÃ÷
+#define START_TASK_PRIO 6 //ÈÎÎñÓÅÏÈ¼¶
+#define START_STK_SIZE 128 //ÈÎÎñ¶ÑÕ»´óÐ¡
+TaskHandle_t StartTask_Handler; //ÈÎÎñ¾ä±ú
+void start_task(void *pvParameters); //ÈÎÎñº¯Êý
+ 
+#define LED1_TASK_PRIO 6 //ÈÎÎñÓÅÏÈ¼¶
+#define LED1_STK_SIZE 128 //ÈÎÎñ¶ÑÕ»´óÐ¡
+TaskHandle_t LED1Task_Handler; //ÈÎÎñ¾ä±ú
+void led1_task(void *p_arg); //ÈÎÎñº¯Êý
+
+// ¶¨Òå´òÓ¡ÈÎÎñµÄÓÅÏÈ¼¶ºÍ¶ÑÕ»´óÐ¡
+#define PRINT_TASK_PRIO 6 // ÈÎÎñÓÅÏÈ¼¶
+#define PRINT_STK_SIZE 256 // ÈÎÎñ¶ÑÕ»´óÐ¡
+TaskHandle_t PrintTask_Handler;// ¶¨Òå´òÓ¡ÈÎÎñµÄ¾ä±ú
+void print_task(void *p_arg);// ´òÓ¡ÈÎÎñº¯Êý
+
+// ¶¨Òå PID ÈÎÎñµÄÓÅÏÈ¼¶ºÍ¶ÑÕ»´óÐ¡
+#define PID_TASK_PRIO 5 // ÈÎÎñÓÅÏÈ¼¶
+#define PID_STK_SIZE 128 // ÈÎÎñ¶ÑÕ»´óÐ¡
+TaskHandle_t PIDTask_Handler; // ¶¨Òå PID ÈÎÎñµÄ¾ä±ú
+void pid_task(void *p_arg); // PID ÈÎÎñº¯Êý
+
+#define TARGET_TASK_PRIO 6 //ÈÎÎñÓÅÏÈ¼¶
+#define TARGET_STK_SIZE 128 //ÈÎÎñ¶ÑÕ»´óÐ¡
+TaskHandle_t TARGETTask_Handler; //ÈÎÎñ¾ä±ú
+void target_task(void *p_arg); //ÈÎÎñº¯Êý
+
+int main(void)
+  { 
+		NVIC_PriorityGroupConfig(NVIC_PriorityGroup_4);
+		LED_Init();
+		delay_init();	    	            //=====ÑÓÊ±º¯Êý³õÊ¼»¯	
+		uart_init(57600);                  //=====´®¿Ú³õÊ¼»¯
+//		uart_init_pid(57600);                  //=====pid´®¿Ú³õÊ¼»¯
+		TIM4_PWM_Init(9999,143);        //=====¶æ»úPWM³õÊ¼»¯
+		TIM4->CCR3=Position1;    //GPIOB8,ÔÆÌ¨¶æ»ú
+		TIM4->CCR4=Position2;
+		//´´½¨¿ªÊ¼ÈÎÎñ
+		xTaskCreate((TaskFunction_t )start_task, //ÈÎÎñº¯Êý
+								(const char* )"start_task", //ÈÎÎñÃû³Æ
+								(uint16_t )START_STK_SIZE, //ÈÎÎñ¶ÑÕ»´óÐ¡
+								(void* )NULL, //´«µÝ¸øÈÎ Îñº¯ÊýµÄ²ÎÊý
+								(UBaseType_t )START_TASK_PRIO, //ÈÎÎñÓÅÏÈ¼¶
+								(TaskHandle_t* )&StartTask_Handler); //ÈÎÎñ¾ä±ú
+								
+		vTaskStartScheduler(); //¿ªÆôÈÎÎñµ÷¶È		
+}
+
+void start_task(void *pvParameters) 
+{ 
+	taskENTER_CRITICAL(); //½øÈëÁÙ½çÇø
+	//´´½¨ LED1ÈÎÎñ
+	xTaskCreate((TaskFunction_t )led1_task, 
+							(const char* )"led1_task", 
+							(uint16_t )LED1_STK_SIZE, 
+							(void* )NULL, 
+							(UBaseType_t )LED1_TASK_PRIO, 
+							(TaskHandle_t* )&LED1Task_Handler);
+	//´´½¨ print ÈÎÎñ
+	xTaskCreate(
+        (TaskFunction_t)print_task, // ÈÎÎñº¯Êý
+        (const char *)"print_task", // ÈÎÎñÃû³Æ
+        (uint16_t)PRINT_STK_SIZE,   // ÈÎÎñ¶ÑÕ»´óÐ¡
+        (void *)NULL,               // ÈÎÎñ²ÎÊý
+        (UBaseType_t)PRINT_TASK_PRIO, // ÈÎÎñÓÅÏÈ¼¶
+        (TaskHandle_t *)&PrintTask_Handler // ÈÎÎñ¾ä±ú
+    );
+		// ´´½¨ PID ÈÎÎñ
+		xTaskCreate(
+				(TaskFunction_t)pid_task, // ÈÎÎñº¯Êý
+				(const char *)"pid_task", // ÈÎÎñÃû³Æ
+				(uint16_t)PID_STK_SIZE,   // ÈÎÎñ¶ÑÕ»´óÐ¡
+				(void *)NULL,             // ÈÎÎñ²ÎÊý
+				(UBaseType_t)PID_TASK_PRIO, // ÈÎÎñÓÅÏÈ¼¶
+				(TaskHandle_t *)&PIDTask_Handler // ÈÎÎñ¾ä±ú
+		);
+		// ´´½¨ TARGET ÈÎÎñ
+		xTaskCreate(
+				(TaskFunction_t)target_task, // ÈÎÎñº¯Êý
+				(const char *)"target_task", // ÈÎÎñÃû³Æ
+				(uint16_t)TARGET_STK_SIZE,   // ÈÎÎñ¶ÑÕ»´óÐ¡
+				(void *)NULL,             // ÈÎÎñ²ÎÊý
+				(UBaseType_t)TARGET_TASK_PRIO, // ÈÎÎñÓÅÏÈ¼¶
+				(TaskHandle_t *)&TARGETTask_Handler // ÈÎÎñ¾ä±ú
+		);
+							
+	vTaskDelete(StartTask_Handler); //É¾³ý¿ªÊ¼ÈÎÎñ
+	taskEXIT_CRITICAL(); //ÍË ³öÁÙ½çÇø
+}
+
+//LED1ÈÎÎñº¯Êý
+void led1_task(void *p_arg) 
+{ 
+	//delay_ms(1000);
+	while(1) 
+	{ 
+		Led_Flash(10);
+		delay_ms(100);
+		
+		/*
+		times_elcmotor+=1;
+		times_noTarget+=1;
+		
+		if(times_noTarget >= 15)
+        {     
+			target2_Round = (target2_Round + 1785)% 1800;
+			Target1=950, Target2=(target2_Round<900?target2_Round:1800-target2_Round)+300;      
+		}
+		*/
+	} 
+}
+//½ÓÊÕºó´òÓ¡ÈÎÎñº¯Êý
+void print_task(void *pvParameters)
+{
+    int count=0;
+    BaseType_t err = pdFALSE;
+
+    int size=50;
+    uint8_t buf[64];//×î¶àÖ»È¡Ç°64¸öÊý¾Ý
+
+    //Çå¿Õ±¾µØ½ÓÊÕÊý×é
+    memset(buf,0,size);
+
+    while(1)
+    {
+        err=xSemaphoreTake(uartSemaphore,100);   //»ñÈ¡ÐÅºÅÁ¿
+        if(err==pdTRUE)                         //»ñÈ¡ÐÅºÅÁ¿³É¹¦
+        {  
+            //printf("%s",Data);
+            if(rx_cnt < size)//ÊÕµ½µÄÊý¾Ý³¤¶ÈÔÚsize·¶Î§ÄÚ
+            {
+                //void *memcpy(void *str1, const void *str2, size_t n)  
+                //´Ó´æ´¢Çø str2 ¸´ÖÆ n ¸ö×Ö½Úµ½´æ´¢Çø str1¡£
+                memcpy(buf,Recv,rx_cnt);//ÓÐ¼¸¸ö¸´ÖÆ¼¸¸ö
+                count=rx_cnt;
+								buf[rx_cnt] = 0;
+                //printf("%s\r\n", buf);
+            }
+            else//ÊÕµ½µÄÊý¾Ý³¤¶ÈÌ«³¤ÁË
+            {
+                memcpy(buf,Recv,size);//Ö»¸´ÖÆsize¸ö
+                count=size;
+								buf[size] = 0;
+            }
+            rx_cnt=0;
+        }
+
+        if(count>0)
+        {
+//						float p,i,d;
+            count=0;
+						if(buf[0] == '&'){
+							sscanf((const char *)buf,"&%f,%f#",&pos1buf,&pos2buf);
+							/*
+							times_noTarget = 0;
+							target2_Round = Target2 - 300;
+							*/
+							//printf("receive:%s",buf);
+						}
+//						else if(buf[0] == '$'){
+//							sscanf((const char *)buf,"$%f,%f,%f#",&p,&i,&d);
+//							Position_KP=p,Position_KI=i,Position_KD=d;
+//							//printf("config:%s",buf);
+//						}
+            //------------------------------------------------------------------------------
+            //ÕâÀï¿ÉÒÔ¼ÌÐø¶Ôbuf½øÐÐ·ÖÎöºÍ´¦Àí£¬±ÈÈç¸ù¾ÝbufµÄ²»Í¬ÄÚÈÝÖ´ÐÐ²»Í¬µÄÐ¡ÈÎÎñ
+
+        }
+    }
+}
+
+
+
+//PIDÈÎÎñº¯Êý
+void pid_task(void *pvParameters){
+	//delay_ms(2000);
+	while(1){
+		/*
+		Velocity1=Position_PID_1(pid01,Velocity1); //¶æ»úPID¿ØÖÆ£¬¿ÉÒÔ¸ù¾ÝÄ¿±êÎ»ÖÃ½øÐÐËÙ¶Èµ÷Õû£¬ÀëÄ¿±êÎ»ÖÃÔ½Ô¶ËÙ¶ÈÔ½¿ì
+		Velocity2=Position_PID_2(pid02,Velocity2); //¶æ»úPID¿ØÖÆ£¬¿ÉÒÔ¸ù¾ÝÄ¿±êÎ»ÖÃ½øÐÐËÙ¶Èµ÷Õû£¬ÀëÄ¿±êÎ»ÖÃÔ½Ô¶ËÙ¶ÈÔ½¿ì
+		//½âÊÍÎªÊ²Ã´»á³öÏÖvelocity-pid£ºÍ¼Ïñ¶Ë´æÔÚ¾µÏñ·­×ª
+		
+		Xianfu_Velocity();
+		
+		Set_Pwm(Velocity1,Velocity2);    //¸³Öµ¸øPWM¼Ä´æÆ÷
+		delay_ms(10);
+		*/
+		
+	}
+}
+//TARGETÈÎÎñº¯Êý£¬´ý¸ÄÎªµÚÒ»¼¶pid¡£
+void target_task(void *pvParameters){
+	while(1){
+		
+		//½â¾öËÀÇøÎÊÌâ
+		float dead_area1 = 3, dead_area2 = 6;
+		if(pos2buf > -dead_area1 && pos2buf < dead_area1) pos2buf = 0;
+		if(pos1buf > -dead_area2 && pos1buf < dead_area2) pos1buf = 0;
+		
+		/*
+		pid01 = Position_PID_01(pos2buf);
+		pid02 = Position_PID_02(pos1buf + 35);     //¼¤¹âµãºÍÊÓÆµÖÐÐÄµãÖ®¼äµÄÆ«²î35
+		
+		//Íâ»·ÏÞ·ù
+		if(pid01 > Speed0) pid01 = Speed0;
+		if(pid01 < -Speed0) pid01 = -Speed0;
+		if(pid02 > Speed0) pid02 = Speed0;
+		if(pid02 < -Speed0) pid02 = -Speed0;
+		*/
+		
+		Velocity1 = Position_PID_01(pos2buf);
+		Velocity2 = Position_PID_02(pos1buf + 35);     //¼¤¹âµãºÍÊÓÆµÖÐÐÄµãÖ®¼äµÄÆ«²î35
+		
+		//Íâ»·ÏÞ·ù
+		if(Velocity1 >  Speed0) Velocity1 = Speed0;
+		if(Velocity1 < -Speed0) Velocity1 = -Speed0;
+		if(Velocity2 >  Speed0) Velocity2 = Speed0;
+		if(Velocity2 < -Speed0) Velocity2 = -Speed0;
+		
+		
+		//ÉèÁ¢Ä¿±êÎ»ÖÃ
+		
+//		Target1 -= pid01;
+//		Target2 -= pid02;
+
+		pos2buf = 0;
+		pos1buf = -35;
+		
+		Xianfu_Pwm();
+		delay_ms(30);
+		
+		Xianfu_Velocity();
+		Set_Pwm(Velocity1,Velocity2);    //¸³Öµ¸øPWM¼Ä´æÆ÷
+		
+		delay_ms(10);
+	}
+}
+
+
+
+
+/*
+//pidµ÷ÊÔ
+void pid_task(void *pvParameters){
+	//delay_ms(2000);
+	while(1){
+		Velocity1=Position_PID_1(Velocity1,pos2buf); //¶æ»úPID¿ØÖÆ£¬¿ÉÒÔ¸ù¾ÝÄ¿±êÎ»ÖÃ½øÐÐËÙ¶Èµ÷Õû£¬ÀëÄ¿±êÎ»ÖÃÔ½Ô¶ËÙ¶ÈÔ½¿ì
+		Velocity2=Position_PID_2(Velocity2,pos1buf+35); //¶æ»úPID¿ØÖÆ£¬¿ÉÒÔ¸ù¾ÝÄ¿±êÎ»ÖÃ½øÐÐËÙ¶Èµ÷Õû£¬ÀëÄ¿±êÎ»ÖÃÔ½Ô¶ËÙ¶ÈÔ½¿ì
+		//Xianfu_Velocity();
+		Set_Pwm(Velocity1,Velocity2);    //¸³Öµ¸øPWM¼Ä´æÆ÷
+		delay_ms(10);
+	}
+}
+
+//TARGETÈÎÎñº¯Êý£¬´ý¸ÄÎªµÚÒ»¼¶pid¡£
+void target_task(void *pvParameters){
+	while(1){
+		
+	}
+}
+
+*/
