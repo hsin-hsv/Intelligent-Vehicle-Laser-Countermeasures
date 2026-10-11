@@ -1,0 +1,9 @@
+
+path: D:/daima/python/yolo/code/data9
+train: images/train
+val: images/val
+
+
+#classes
+names:
+  0: stripe
